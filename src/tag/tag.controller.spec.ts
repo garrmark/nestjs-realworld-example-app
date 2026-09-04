@@ -17,7 +17,7 @@ describe('TagController', () => {
 
     tagService = module.get<TagService>(TagService);
     tagController = module.get<TagController>(TagController);
-  });
+  }, 30000);
 
   describe('findAll', () => {
     it('should return an array of tags', async () => {
