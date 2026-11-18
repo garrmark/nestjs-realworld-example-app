@@ -1,0 +1,218 @@
+# lineai-intelligence-build-feedback v2
+name: Lineai Intelligence Build Feedback
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-feedback:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prep lab CA bundle
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE="${{ runner.temp }}/lab-ca-bundle.pem"
+          HOST_CA=/usr/local/share/ca-certificates/prodsim-tng-local-ca.crt
+          : > "$BUNDLE"
+          if [[ -f "$HOST_CA" ]]; then cat "$HOST_CA" >> "$BUNDLE"; fi
+          HOST="tng.127.0.0.1.nip.io"
+          openssl s_client -showcerts -connect "${HOST}:443" -servername "$HOST" </dev/null 2>/dev/null \
+            | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/{print}' >> "$BUNDLE" || true
+          if ! grep -q "BEGIN CERTIFICATE" "$BUNDLE"; then
+            curl -sf http://127.0.0.1:9090/api/ca.pem >> "$BUNDLE" || true
+          fi
+          echo "LAB_CA_BUNDLE=$BUNDLE" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build and test
+        id: build
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          : > build.log
+          status=0
+          ran_build=false
+
+          if [ -x ./mvnw ]; then
+            ran_build=true
+            ./mvnw verify 2>&1 | tee -a build.log
+            status=$(( status | ${PIPESTATUS[0]} ))
+          elif [ -f pom.xml ]; then
+            ran_build=true
+            mvn verify 2>&1 | tee -a build.log
+            status=$(( status | ${PIPESTATUS[0]} ))
+          fi
+
+          if [ -x ./gradlew ]; then
+            ran_build=true
+            ./gradlew build 2>&1 | tee -a build.log
+            status=$(( status | ${PIPESTATUS[0]} ))
+          fi
+
+          dotnet_target="$(find . -maxdepth 2 -type f -name '*.sln' -print | sort | head -n 1)"
+          if [ -z "$dotnet_target" ]; then
+            dotnet_target="$(find . -maxdepth 3 -type f -name '*.csproj' -print | sort | head -n 1)"
+          fi
+          if [ -n "$dotnet_target" ]; then
+            ran_build=true
+            current_branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+            if [ "$current_branch" = "lineai/bootstrap-config" ]; then
+              # MSBuild reads this as a global property; a -p: argument would split on the semicolons.
+              export WarningsNotAsErrors='NU1901;NU1902;NU1903;NU1904'
+            fi
+            dotnet test "$dotnet_target" 2>&1 | tee -a build.log
+            status=$(( status | ${PIPESTATUS[0]} ))
+          fi
+
+          if [ -f package.json ]; then
+            ran_build=true
+            current_branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+            package_manager="$(node -p "require('./package.json').packageManager?.split('@')[0] || ''")"
+            if [ -z "$package_manager" ]; then
+              if [ -f package-lock.json ]; then
+                # Prefer npm when legacy repositories contain mixed npm and Yarn lockfiles.
+                package_manager=npm
+              elif [ -f pnpm-lock.yaml ]; then
+                package_manager=pnpm
+              elif [ -f yarn.lock ]; then
+                package_manager=yarn
+              else
+                package_manager=npm
+              fi
+            fi
+
+            install_status=0
+            case "$package_manager" in
+              pnpm)
+                corepack enable 2>&1 | tee -a build.log
+                install_status=${PIPESTATUS[0]}
+                if [ "$install_status" -eq 0 ]; then
+                  pnpm install --frozen-lockfile 2>&1 | tee -a build.log
+                  install_status=${PIPESTATUS[0]}
+                fi
+                ;;
+              yarn)
+                corepack enable 2>&1 | tee -a build.log
+                install_status=${PIPESTATUS[0]}
+                if [ "$install_status" -eq 0 ]; then
+                  yarn install --frozen-lockfile 2>&1 | tee -a build.log
+                  install_status=${PIPESTATUS[0]}
+                fi
+                ;;
+              npm)
+                if [ -f package-lock.json ]; then
+                  lockfile_version="$(node -p "try{String(require('./package-lock.json').lockfileVersion||0)}catch(e){'0'}")"
+                  if [ "$current_branch" = "lineai/bootstrap-config" ] && [ "${lockfile_version}" -lt 2 ]; then
+                    # lockfile v1 on modern Node: npm ci often hangs or crashes during onboarding baseline.
+                    npm install --no-audit --no-fund --ignore-scripts 2>&1 | tee -a build.log
+                  else
+                    npm ci 2>&1 | tee -a build.log
+                  fi
+                else
+                  npm install 2>&1 | tee -a build.log
+                fi
+                install_status=${PIPESTATUS[0]}
+                ;;
+              *)
+                echo "Unsupported package manager: $package_manager" | tee -a build.log
+                install_status=1
+                ;;
+            esac
+            status=$(( status | install_status ))
+
+            # Missing dependencies obscure the real install error with follow-on command failures.
+            if [ "$install_status" -eq 0 ]; then
+              case "$package_manager" in
+                pnpm)
+                  if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
+                    pnpm test 2>&1 | tee -a build.log
+                    status=$(( status | ${PIPESTATUS[0]} ))
+                  fi
+                  if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+                    pnpm build 2>&1 | tee -a build.log
+                    status=$(( status | ${PIPESTATUS[0]} ))
+                  fi
+                  ;;
+                yarn)
+                  if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
+                    yarn test 2>&1 | tee -a build.log
+                    status=$(( status | ${PIPESTATUS[0]} ))
+                  fi
+                  if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+                    yarn build 2>&1 | tee -a build.log
+                    status=$(( status | ${PIPESTATUS[0]} ))
+                  fi
+                  ;;
+                npm)
+                  npm test --if-present 2>&1 | tee -a build.log
+                  status=$(( status | ${PIPESTATUS[0]} ))
+                  npm run build --if-present 2>&1 | tee -a build.log
+                  status=$(( status | ${PIPESTATUS[0]} ))
+                  ;;
+              esac
+            fi
+          fi
+
+          if [ "$ran_build" = false ]; then
+            echo "No supported build manifest found." | tee -a build.log
+            status=1
+          fi
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure Lineai build.log exists
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f build.log ]; then
+            echo "No teed build.log found; a step may have failed before log capture." > build.log
+          fi
+
+      - name: Send build result to Lineai
+        if: always()
+        shell: bash
+        env:
+          LINEAI_HOST: ${{ vars.LINEAI_HOST }}
+          AGENT_UUID: ${{ vars.AGENT_UUID }}
+          AGENT_PASSWORD: ${{ secrets.AGENT_PASSWORD }}
+          CURL_CA_BUNDLE: ${{ env.LAB_CA_BUNDLE }}
+          SSL_CERT_FILE: ${{ env.LAB_CA_BUNDLE }}
+        run: |
+          docker run --pull always --rm --network host \
+            --env LINEAI_HOST --env AGENT_UUID --env AGENT_PASSWORD \
+            --env CURL_CA_BUNDLE --env SSL_CERT_FILE \
+            --volume "${{ github.workspace }}:/github/workspace" \
+            --volume "${{ env.LAB_CA_BUNDLE }}:${{ env.LAB_CA_BUNDLE }}:ro" \
+            lineaipublic.azurecr.io/lineai_send-build-info:latest \
+            send_build_info \
+              --path=/github/workspace \
+              --pipeline-system="GitHub Actions" \
+              --job-name="${{ github.repository }} / ${{ github.workflow }}" \
+              --build-number="${{ github.run_number }}" \
+              --build-status="${{ job.status }}" \
+              --log-file=/github/workspace/build.log
+
+      - name: Preserve build status
+        if: always()
+        shell: bash
+        run: exit "${{ steps.build.outputs.exit_code || '1' }}"
