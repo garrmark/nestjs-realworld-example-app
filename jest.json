@@ -9,6 +9,10 @@
     "^.+\\.tsx?$": "<rootDir>/node_modules/ts-jest/preprocessor.js"
   },
   "testRegex": "/src/.*\\.(test|spec).(ts|tsx|js)$",
+  "moduleNameMapper": {
+    "^node:crypto$": "<rootDir>/jest-shims/crypto.js",
+    "^node:util$": "<rootDir>/jest-shims/util.js"
+  },
   "collectCoverageFrom" : ["src/**/*.{js,jsx,tsx,ts}", "!**/node_modules/**", "!**/vendor/**"],
   "coverageReporters": ["json", "lcov"]
 }
