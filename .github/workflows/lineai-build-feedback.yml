@@ -9,9 +9,27 @@ permissions:
 
 jobs:
   build-feedback:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prep lab CA bundle
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE="${{ runner.temp }}/lab-ca-bundle.pem"
+          HOST_CA=/usr/local/share/ca-certificates/prodsim-tng-local-ca.crt
+          : > "$BUNDLE"
+          if [[ -f "$HOST_CA" ]]; then cat "$HOST_CA" >> "$BUNDLE"; fi
+          HOST="tng.127.0.0.1.nip.io"
+          openssl s_client -showcerts -connect "${HOST}:443" -servername "$HOST" </dev/null 2>/dev/null \
+            | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/{print}' >> "$BUNDLE" || true
+          if ! grep -q "BEGIN CERTIFICATE" "$BUNDLE"; then
+            curl -sf http://127.0.0.1:9090/api/ca.pem >> "$BUNDLE" || true
+          fi
+          echo "LAB_CA_BUNDLE=$BUNDLE" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -172,19 +190,24 @@ jobs:
 
       - name: Send build result to Lineai
         if: always()
-        uses: lineai-intelligence/lineai-send-build-info-github-action@v1.0.3
-        with:
-          lineai_host: ${{ vars.LINEAI_HOST }}
-          agent_uuid: ${{ vars.AGENT_UUID }}
-          agent_password: ${{ secrets.AGENT_PASSWORD }}
-          scan_path: /github/workspace
-          job_name: ${{ github.repository }} / ${{ github.workflow }}
-          build_number: ${{ github.run_number }}
-          build_status: ${{ steps.build.outputs.exit_code == '0' && 'SUCCESS' || 'FAILURE' }}
-          pipeline_system: GitHub Actions
-          log_file: /github/workspace/build.log
-
-      - name: Preserve build status
-        if: always()
         shell: bash
-        run: exit "${{ steps.build.outputs.exit_code || '1' }}"
+        env:
+          LINEAI_HOST: ${{ vars.LINEAI_HOST }}
+          AGENT_UUID: ${{ vars.AGENT_UUID }}
+          AGENT_PASSWORD: ${{ secrets.AGENT_PASSWORD }}
+          CURL_CA_BUNDLE: ${{ env.LAB_CA_BUNDLE }}
+          SSL_CERT_FILE: ${{ env.LAB_CA_BUNDLE }}
+        run: |
+          docker run --pull always --rm --network host \
+            --env LINEAI_HOST --env AGENT_UUID --env AGENT_PASSWORD \
+            --env CURL_CA_BUNDLE --env SSL_CERT_FILE \
+            --volume "${{ github.workspace }}:/github/workspace" \
+            --volume "${{ env.LAB_CA_BUNDLE }}:${{ env.LAB_CA_BUNDLE }}:ro" \
+            lineaipublic.azurecr.io/lineai_send-build-info:latest \
+            send_build_info \
+              --path=/github/workspace \
+              --pipeline-system="GitHub Actions" \
+              --job-name="${{ github.repository }} / ${{ github.workflow }}" \
+              --build-number="${{ github.run_number }}" \
+              --build-status="${{ job.status }}" \
+              --log-file=/github/workspace/build.log

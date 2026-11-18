@@ -24,9 +24,32 @@ permissions:
 
 jobs:
   source-scan:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prep lab CA bundle
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE="${{ runner.temp }}/lab-ca-bundle.pem"
+          HOST_CA=/usr/local/share/ca-certificates/prodsim-tng-local-ca.crt
+          : > "$BUNDLE"
+          if [[ -f "$HOST_CA" ]]; then cat "$HOST_CA" >> "$BUNDLE"; fi
+          HOST="tng.127.0.0.1.nip.io"
+          openssl s_client -showcerts -connect "${HOST}:443" -servername "$HOST" </dev/null 2>/dev/null \
+            | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/{print}' >> "$BUNDLE" || true
+          if ! grep -q "BEGIN CERTIFICATE" "$BUNDLE"; then
+            curl -sf http://127.0.0.1:9090/api/ca.pem >> "$BUNDLE" || true
+          fi
+          echo "LAB_CA_BUNDLE=$BUNDLE" >> "$GITHUB_ENV"
+          TS="${{ runner.temp }}/lab-truststore.jks"
+          rm -f "$TS"
+          if [[ -f "$HOST_CA" ]]; then
+            keytool -importcert -noprompt -alias labca -file "$HOST_CA" -keystore "$TS" -storepass changeit
+          fi
+          echo "LAB_TRUSTSTORE=$TS" >> "$GITHUB_ENV"
 
       - name: Detect project type
         id: detect
@@ -118,14 +141,16 @@ jobs:
           AGENT_PASSWORD: ${{ secrets.AGENT_PASSWORD }}
           JAVA_METHOD_FILTER: ${{ steps.detect.outputs.java_method_filter }}
         run: |
-          docker run --pull always --rm \
+          docker run --pull always --rm --network host \
             --env LINEAI_HOST \
             --env AGENT_UUID \
             --env AGENT_PASSWORD \
             --env JAVA_METHOD_FILTER \
             --env SCAN_PATH_FILTER=java \
             --env SCAN_PATH_DEPTH=-1 \
+            --env JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=/lab-truststore.jks -Djavax.net.ssl.trustStorePassword=changeit" \
             --volume "${{ github.workspace }}:/scan" \
+            --volume "${{ env.LAB_TRUSTSTORE }}:/lab-truststore.jks:ro" \
             --entrypoint /bin/bash \
             lineaipublic.azurecr.io/lineai_source_java:latest \
             -c 'set -euo pipefail
@@ -207,7 +232,7 @@ jobs:
           nuget_packages="${NUGET_PACKAGES:-$HOME/.nuget/packages}"
           mkdir -p "$nuget_packages"
           scan_log="$(mktemp)"
-          docker run --pull always --rm \
+          docker run --pull always --rm --network host \
             --env LINEAI_HOST \
             --env AGENT_UUID \
             --env AGENT_PASSWORD \
@@ -262,7 +287,7 @@ jobs:
             fi
           done < <(find "$js_scan_root" -type f \
             \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' \) -print0)
-          docker run --pull always --rm \
+          docker run --pull always --rm --network host \
             --env LINEAI_HOST="$lineai_host" \
             --env AGENT_UUID \
             --env AGENT_PASSWORD \
