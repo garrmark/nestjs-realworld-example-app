@@ -211,3 +211,8 @@ jobs:
               --build-number="${{ github.run_number }}" \
               --build-status="${{ job.status }}" \
               --log-file=/github/workspace/build.log
+
+      - name: Preserve build status
+        if: always()
+        shell: bash
+        run: exit "${{ steps.build.outputs.exit_code || '1' }}"
