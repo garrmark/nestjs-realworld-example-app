@@ -291,7 +291,11 @@ jobs:
             --env LINEAI_HOST="$lineai_host" \
             --env AGENT_UUID \
             --env AGENT_PASSWORD \
+            --env NODE_EXTRA_CA_CERTS=/lab-ca.pem \
+            --env SSL_CERT_FILE=/lab-ca.pem \
+            --env CURL_CA_BUNDLE=/lab-ca.pem \
             --volume "$js_scan_root:/scan:ro" \
+            --volume "${{ env.LAB_CA_BUNDLE }}:/lab-ca.pem:ro" \
             lineaipublic.azurecr.io/lineai_javascript:latest \
             analyze \
               --application "${{ github.event.repository.name }}" \
