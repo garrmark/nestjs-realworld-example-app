@@ -209,7 +209,7 @@ jobs:
               --pipeline-system="GitHub Actions" \
               --job-name="${{ github.repository }} / ${{ github.workflow }}" \
               --build-number="${{ github.run_number }}" \
-              --build-status="${{ job.status }}" \
+              --build-status="${{ steps.build.outputs.exit_code == '0' && 'success' || 'failure' }}" \
               --log-file=/github/workspace/build.log
 
       - name: Preserve build status
